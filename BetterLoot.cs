@@ -769,16 +769,21 @@ namespace Oxide.Plugins
         public class ProbalisticRNG
         {
             [JsonIgnore]
-            private List<double> _culminativeProbabilities = new List<double>();
+            private readonly List<double> _culminativeProbabilities = new List<double>();
 
             [JsonIgnore]
             public bool DoProbabilitiesExist
-                => _culminativeProbabilities.Any();
+                => _culminativeProbabilities.Count > 0;
+
+            public void ClearProbabilities()
+                => _culminativeProbabilities.Clear();
 
             public void UpdateProbabilities(IEnumerable<double> probabilities)
             {
-                double _culminative = 0;
-                foreach (int item in probabilities)
+                _culminativeProbabilities.Clear();
+
+                double _culminative = 0d;
+                foreach (double item in probabilities)
                 {
                     _culminative += item;
                     _culminativeProbabilities.Add(_culminative);
@@ -892,7 +897,42 @@ namespace Oxide.Plugins
 
             #region Random Profile Selector
             [JsonIgnore]
-            private List<int> _enabledProfiles = new List<int>(); // Map position to index
+            private LootProfileImport[]? _enabledProfileCache;
+
+            private void EnsureProfileCache()
+            {
+                if (_enabledProfileCache is not null)
+                    return;
+
+                List<LootProfileImport> enabledProfiles = Pool.Get<List<LootProfileImport>>();
+
+                for (int i = 0; i < LootProfiles.Count; i++)
+                {
+                    LootProfileImport profile = LootProfiles[i];
+                    if (profile.Enabled)
+                        enabledProfiles.Add(profile);
+                }
+
+                _enabledProfileCache = enabledProfiles.ToArray();
+
+                if (!DoProbabilitiesExist && _enabledProfileCache.Length > 0)
+                {
+                    List<double> probabilities = Pool.Get<List<double>>();
+                    for (int i = 0; i < _enabledProfileCache.Length; i++)
+                        probabilities.Add(_enabledProfileCache[i].LootProfileProbability);
+
+                    UpdateProbabilities(probabilities);
+                    Pool.FreeUnmanaged(ref probabilities);
+                }
+
+                Pool.FreeUnmanaged(ref enabledProfiles);
+            }
+
+            public void InvalidateRuntimeCaches()
+            {
+                _enabledProfileCache = null;
+                ClearProbabilities();
+            }
 
             /// <summary>
             /// Implemented binary search to select random loot import profile quickly. Returns null if should select from ungrouped items.
@@ -901,31 +941,20 @@ namespace Oxide.Plugins
             /// <returns></returns>
             public LootProfile? GetRandomProfile(string? tableReference)
             { 
-                if (LootProfiles is null)
+                if (LootProfiles is null || LootProfiles.Count == 0)
                     return null;
 
-                if (!DoProbabilitiesExist)
-                { // Updates and uses probalistic probability based off of only enabled profiles
-                    List<LootProfileImport> _enabledProfiles = new List<LootProfileImport>();
-                    for (int i = 0; i < LootProfiles.Count; i++)
-                    {
-                        var profile = LootProfiles[i];
-                        if (profile.Enabled)
-                        {
-                            _enabledProfiles.Add(profile);
-                            this._enabledProfiles.Add(i);
-                        }
-                    }
+                EnsureProfileCache();
 
-                    UpdateProbabilities(_enabledProfiles.Select(x => x.LootProfileProbability));
-                }
+                if (_enabledProfileCache is null || _enabledProfileCache.Length == 0)
+                    return null;
 
                 int randomProfileIndex = GetRandomIndex();
-                if (randomProfileIndex >= _enabledProfiles.Count)
+                if ((uint)randomProfileIndex >= (uint)_enabledProfileCache.Length)
                     return null;
 
-                var importProfile = LootProfiles[_enabledProfiles[randomProfileIndex]];
-                
+                LootProfileImport importProfile = _enabledProfileCache[randomProfileIndex];
+
                 if (!lootGroups.LootGroups.TryGetValue(importProfile.LootProfileName, out LootProfile? _profile) || _profile is null)
                 {
                     Log($"WARNING: prefab \"{tableReference}\" requested a loot group import with name \"{importProfile.LootProfileName}\". Group does not exist!");
@@ -952,10 +981,37 @@ namespace Oxide.Plugins
             [JsonProperty("Item List")]
             public Dictionary<string, LootRNG> ItemList;
 
+            [JsonIgnore]
+            private KeyValuePair<string, LootRNG>[]? _itemListCache;
+
             public LootProfile(Dictionary<string, LootRNG> ItemList, bool Enabled = true)
             {
                 this.ItemList = ItemList;
                 this.Enabled = Enabled;
+            }
+
+            public void InvalidateRuntimeCaches()
+            {
+                _itemListCache = null;
+                ClearProbabilities();
+            }
+
+            private void EnsureItemCache()
+            {
+                if (_itemListCache is not null)
+                    return;
+
+                _itemListCache = ItemList.ToArray();
+
+                if (!DoProbabilitiesExist && _itemListCache.Length > 0)
+                {
+                    List<double> probabilities = Pool.Get<List<double>>();
+                    for (int i = 0; i < _itemListCache.Length; i++)
+                        probabilities.Add(_itemListCache[i].Value.Probability);
+
+                    UpdateProbabilities(probabilities);
+                    Pool.FreeUnmanaged(ref probabilities);
+                }
             }
 
             public class LootRNG
@@ -979,59 +1035,58 @@ namespace Oxide.Plugins
             /// </summary>
             public (Item?, List<Item>?) GetItem(HashSet<string> currentItemEntries)
             {
-                int itemIndex = GetRandomIndex();
+                EnsureItemCache();
 
-                // No item found, out of index
-                if (itemIndex >= ItemList.Count)
+                if (_itemListCache is null || _itemListCache.Length == 0)
                     return (null, null);
 
-                List<Item> bonusItems = new List<Item>();
+                int itemIndex = GetRandomIndex();
 
-                var entry = ItemList.ElementAt(itemIndex);
-              
-                if (!entry.Value.Amount.allowDuplicates && currentItemEntries.Contains(entry.Key))
+                if ((uint)itemIndex >= (uint)_itemListCache.Length)
+                    return (null, null);
+
+                KeyValuePair<string, LootRNG> entry = _itemListCache[itemIndex];
+                LootEntry amountSettings = entry.Value.Amount;
+                List<Item>? bonusItems = null;
+
+                if (!amountSettings.allowDuplicates && currentItemEntries.Contains(entry.Key))
                 {
-                    // Only item in the list and it's a duplicate, else all hope is lost :(
-                    if (ItemList.Count == 1)
+                    if (_itemListCache.Length == 1)
                         return (null, null);
 
-                    // Prefer the larger-index neighbour, fall back to smaller
-                    if (itemIndex < ItemList.Count - 1) itemIndex++;
-                    else if (itemIndex > 0 && (entry.Value.Probability - ItemList.ElementAt(itemIndex - 1).Value.Probability) <= _config.LootGroupsConfig.AllowedDuplicateNudgeDifference) itemIndex--;
-                    else return (null, null); 
+                    if (itemIndex < _itemListCache.Length - 1)
+                        itemIndex++;
+                    else if (itemIndex > 0 && (entry.Value.Probability - _itemListCache[itemIndex - 1].Value.Probability) <= _config.LootGroupsConfig.AllowedDuplicateNudgeDifference)
+                        itemIndex--;
+                    else
+                        return (null, null); 
 
-                    // Set entry to the entry of the nudged index
-                    entry = ItemList.ElementAt(itemIndex);
+                    entry = _itemListCache[itemIndex];
+                    amountSettings = entry.Value.Amount;
                 }
 
-                entry.Value.Amount.CreateBonusItems(ref bonusItems);
+                amountSettings.CreateBonusItems(ref bonusItems);
 
-                // Select Amount
-                int amount = GetRNG(entry.Value.Amount.Min, entry.Value.Amount.Max);
+                int amount = GetRNG(amountSettings.Min, amountSettings.Max);
 
-                // Get Custom Properties
-                ulong skinId = entry.Value.Amount.SkinId;
-                string? customName = entry.Value.Amount.DisplayName;
+                Item item = ItemManager.CreateByName(amountSettings.CachedShortname ?? UniqueTagREGEX.Replace(entry.Key, string.Empty), amount, amountSettings.SkinId);
+                if (item is null)
+                {
+                    Log($"ERROR: item \"{entry.Key}\" could not be created! System returned null entry!");
+                    return (null, bonusItems);
+                }
 
-                // Create Item
-                string sanitizedName = UniqueTagREGEX.Replace(entry.Key, string.Empty);
-                Item item = ItemManager.CreateByPartialName(sanitizedName, amount);
-                if (!string.IsNullOrWhiteSpace(customName))
-                    item.name = customName;
-                item.skin = skinId;
+                if (!string.IsNullOrWhiteSpace(amountSettings.DisplayName))
+                    item.name = amountSettings.DisplayName;
 
-                entry.Value.Amount.ApplyAttachments(item);
-                entry.Value.Amount.ApplyAmmo(item);
+                amountSettings.ApplyAttachments(item);
+                amountSettings.ApplyAmmo(item);
 
-                if (entry.Value.Amount.DurabilitySettings is LootEntryDurability durability)
+                if (amountSettings.DurabilitySettings is LootEntryDurability durability)
                     item.ChangeConditionPercentage(GetRNG(durability.MinDurability, durability.MaxDurability));
 
                 item.MarkDirty();
 
-                if (item is null)
-                    Log($"ERROR: item \"{entry.Key}\" could not be created! System returned null entry!");
-                
-                // Add for future duplicate checking.
                 currentItemEntries.Add(entry.Key);
 
                 return (item, bonusItems);
@@ -1048,6 +1103,9 @@ namespace Oxide.Plugins
             [JsonProperty("Display Name (empty = none)")]
             public string? DisplayName = string.Empty;
 
+            [JsonIgnore]
+            public string? CachedShortname;
+
             [JsonProperty("Item Minimum")]
             public int Min;
 
@@ -1063,69 +1121,85 @@ namespace Oxide.Plugins
 
             public void ApplyAttachments(Item item)
             {
-                // No mods to apply
-                if (!(ItemEntryModifications?.AttachmentSettings?.itemMods.Any() ?? false))
+                ItemEntrySettings? mods = ItemEntryModifications;
+                ItemEntrySettings.ItemModSettings? attachmentSettings = mods?.AttachmentSettings;
+
+                if (attachmentSettings == null || attachmentSettings.itemMods == null || attachmentSettings.itemMods.Count == 0 || mods.maxMods <= 0)
                     return;
 
-                // Recursively apply
-                int total = Math.Clamp(GetRNG(ItemEntryModifications.AttachmentSettings.minModAmount, ItemEntryModifications.AttachmentSettings.maxModAmount), 1, ItemEntryModifications.maxMods);
+                ItemContainer? contents = item.contents;
+                if (contents == null)
+                    return;
+
+                int total = Math.Clamp(GetRNG(attachmentSettings.minModAmount, attachmentSettings.maxModAmount), 1, mods.maxMods);
                 for (int i = 0; i < total; i++)
                 {
                     for (int r = 0; r < 5; r++)
                     {
-                        Item? itemMod = ItemEntryModifications?.GetRandomItemMod();
-                        if (itemMod is null) // No item selected! This is ok.
+                        Item? itemMod = mods.GetRandomItemMod();
+                        if (itemMod is null)
                             break;
 
-                        // Attempt to regenerate if there is a duplicate
-                        if (itemMod.MoveToContainer(item.contents))
+                        if (itemMod.MoveToContainer(contents))
                             break;
+
+                        itemMod.Remove();
                     }
                 }
             }
 
             public void ApplyAmmo(Item item)
             {
-                if (ItemEntryModifications?.AmmunitionSettings is not ItemEntrySettings.AmmoSettings ammoSettings || string.IsNullOrWhiteSpace(ammoSettings.AmmoItemShortname))
+                if (ItemEntryModifications?.AmmunitionSettings is not ItemEntrySettings.AmmoSettings ammoSettings)
                     return;
 
-                // if extended mag is applied, add 25% to calculated ammo amount
-                ItemDefinition? ammoDef = null;
-                int ammoAmount = 1;
-                bool applyExtraAmmo = item.contents?.itemList.Any(x => x.info.shortname.Equals("weapon.mod.extendedmags")) ?? false;            
-            
-                if (ammoSettings.CanHoldMultipleAmmoUnits)
-                {
-                    ammoDef = ItemManager.FindDefinitionByPartialName(ammoSettings.AmmoItemShortname);
-                    ammoAmount = Math.Clamp(GetRNG(ammoSettings.Min, ammoSettings.Max), 0, ammoSettings.MaxAmmo);
-
-                    if (item.contents?.itemList.Any(x => x.info.shortname.Equals("weapon.mod.extendedmags")) ?? false)
-                        ammoAmount = (int)Math.Ceiling(ammoAmount * 1.25);
-                }
-                else if (GetRNG(0, 100) <= ammoSettings.Probability)
-                {
-                    ammoDef = ItemManager.FindDefinitionByPartialName(ammoSettings.AmmoItemShortname);
-                }
-
-                // No ammo defined
+                ItemDefinition? ammoDef = ammoSettings.CachedAmmoDefinition;
                 if (ammoDef is null)
                     return;
 
-                // Type check of how should apply
+                int ammoAmount = 1;
+                bool hasExtendedMag = false;
+
+                ItemContainer? contents = item.contents;
+                if (contents != null)
+                {
+                    List<Item> modList = contents.itemList;
+                    for (int i = 0; i < modList.Count; i++)
+                    {
+                        if (modList[i].info.shortname == "weapon.mod.extendedmags")
+                        {
+                            hasExtendedMag = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (ammoSettings.CanHoldMultipleAmmoUnits)
+                {
+                    ammoAmount = Math.Clamp(GetRNG(ammoSettings.Min, ammoSettings.Max), 0, ammoSettings.MaxAmmo);
+
+                    if (hasExtendedMag)
+                        ammoAmount = (int)Math.Ceiling(ammoAmount * 1.25d);
+                }
+                else if (GetRNG(0, 100) > ammoSettings.Probability)
+                {
+                    return;
+                }
+
                 var heldEntity = item.GetHeldEntity();
                 if (heldEntity is BaseProjectile bp)
                 {
-                    var magazine = bp.primaryMagazine.ammoType = ammoDef;
+                    bp.primaryMagazine.ammoType = ammoDef;
                     bp.primaryMagazine.contents = ammoAmount;
                     bp.SendNetworkUpdateImmediate();
-                } else if (heldEntity is FlameThrower ft)
+                }
+                else if (heldEntity is FlameThrower ft)
                 { 
-                    // Vanilla rust spawns this with full fuel
-                    // By default should only be lowgrade fuel but leave the definition open for allowing custom fuel types
                     ft.fuelType = ammoDef;
                     ft.ammo = ammoAmount;
                     ft.SendNetworkUpdateImmediate();
-                } else if (heldEntity is LiquidWeapon lw)
+                }
+                else if (heldEntity is LiquidWeapon lw)
                 {
                     if (lw.GetContents() is Item _liquid)
                     {
@@ -1167,6 +1241,9 @@ namespace Oxide.Plugins
                 public string AmmoItemShortname = string.Empty;  // Item shortname of ammo item
 
                 [JsonIgnore]
+                public ItemDefinition? CachedAmmoDefinition;
+
+                [JsonIgnore]
                 public int MaxAmmo; // Maximum ammo the item can take.
 
                 // These should only be added in config if the weapon can hold more than 1 unit of ammunition. (e.g harpoon gun vs ak)
@@ -1194,7 +1271,9 @@ namespace Oxide.Plugins
             [JsonIgnore]
             public int maxMods; // Maximum amount of mods the item can have.
             [JsonIgnore]
-            private List<double> _culminativeProbabilities = new List<double>();
+            private readonly List<double> _culminativeProbabilities = new List<double>();
+            [JsonIgnore]
+            private KeyValuePair<string, ItemModEntry>[]? _itemModCache;
             #endregion
             public class ItemModEntry
             {
@@ -1259,12 +1338,28 @@ namespace Oxide.Plugins
                 }
             }
 
+            public void InvalidateRuntimeCaches()
+            {
+                _culminativeProbabilities.Clear();
+                _itemModCache = null;
+            }
+
             public void UpdateProbabilities()
             {
-                double _culminative = 0;
-                foreach (var item in AttachmentSettings.itemMods.Values)
+                _culminativeProbabilities.Clear();
+
+                if (!(AttachmentSettings?.itemMods?.Count > 0))
                 {
-                    _culminative += item.Probability;
+                    _itemModCache = null;
+                    return;
+                }
+
+                _itemModCache = AttachmentSettings.itemMods.ToArray();
+
+                double _culminative = 0d;
+                for (int i = 0; i < _itemModCache.Length; i++)
+                {
+                    _culminative += _itemModCache[i].Value.Probability;
                     _culminativeProbabilities.Add(_culminative);
                 }
             }
@@ -1272,8 +1367,11 @@ namespace Oxide.Plugins
             // Get random attachment from list
             public Item? GetRandomItemMod()
             {
-                if (!_culminativeProbabilities.Any())
+                if ((_itemModCache is null || _itemModCache.Length == 0) || _culminativeProbabilities.Count == 0)
                     UpdateProbabilities();
+
+                if (_itemModCache is null || _itemModCache.Length == 0)
+                    return null;
 
                 double randomSelect = RNG.NextDouble() * 1e2;
                 int itemIndex = _culminativeProbabilities.BinarySearch(randomSelect);
@@ -1281,16 +1379,13 @@ namespace Oxide.Plugins
                 if (itemIndex < 0)
                     itemIndex = ~itemIndex;
 
-                // No item found
-                if (itemIndex >= AttachmentSettings.itemMods.Count)
+                if ((uint)itemIndex >= (uint)_itemModCache.Length)
                     return null;
 
-                var entry = AttachmentSettings.itemMods.ElementAt(itemIndex);
+                KeyValuePair<string, ItemModEntry> entry = _itemModCache[itemIndex];
 
-                // Create Item
                 Item item = ItemManager.CreateByName(entry.Key);
 
-                // Dont need to send network update, it will be sent with OnVirginSpawn()
                 if (item is null)
                 {
                     Log($"ERROR: item \"{entry.Key}\" could not be created! System returned null entry!");
@@ -1301,7 +1396,7 @@ namespace Oxide.Plugins
                     item.ChangeConditionPercentage(GetRNG(entry.Value.Durability.MinDurability, entry.Value.Durability.MaxDurability));
 
                 item.OnVirginSpawn();
-                
+
                 return item;
             }
             #endregion
@@ -1333,7 +1428,7 @@ namespace Oxide.Plugins
                 foreach (var bonusItemEntry in additionalItems)
                 {
                     var _bonusItemEntry = bonusItemEntry.Value;
-                    Item bonusItem = ItemManager.CreateByName(bonusItemEntry.Key, GetRNG(_bonusItemEntry.Min, _bonusItemEntry.Max) * _config.Loot.LootMultiplier, _bonusItemEntry.SkinId);
+                    Item bonusItem = ItemManager.CreateByName(_bonusItemEntry.CachedShortname ?? bonusItemEntry.Key, GetRNG(_bonusItemEntry.Min, _bonusItemEntry.Max) * _config.Loot.LootMultiplier, _bonusItemEntry.SkinId);
 
                     // Apply attachments if applicable
                     _bonusItemEntry.ApplyAttachments(bonusItem);
@@ -1685,6 +1780,7 @@ namespace Oxide.Plugins
             void scanEntry(string itemKey, LootEntrySettings itemEntry, string lootTableKey, ref bool modificationFlag)
             {
                 var defName = UniqueTagREGEX.Replace(itemKey, string.Empty);
+                itemEntry.CachedShortname = defName;
 
                 // Check if needs durability
                 if (DurabilityItems.Contains(itemKey))
@@ -1718,10 +1814,15 @@ namespace Oxide.Plugins
                 // Build entry flags
                 itemEntry.ItemEntryModifications.AmmunitionSettings.MaxAmmo = WIEntry.MaxAmmo;
                 itemEntry.ItemEntryModifications.AmmunitionSettings.CanHoldMultipleAmmoUnits = WIEntry.MaxAmmo > 1;
+                itemEntry.ItemEntryModifications.AmmunitionSettings.CachedAmmoDefinition =
+                    string.IsNullOrWhiteSpace(itemEntry.ItemEntryModifications.AmmunitionSettings.AmmoItemShortname)
+                        ? null
+                        : ItemManager.FindItemDefinition(itemEntry.ItemEntryModifications.AmmunitionSettings.AmmoItemShortname);
                 itemEntry.ItemEntryModifications.maxMods = WIEntry.MaxMods;
 
                 // Balance profile
                 itemEntry.ItemEntryModifications.BalanceItemModProbabilities();
+                itemEntry.ItemEntryModifications.InvalidateRuntimeCaches();
 
                 // Scan item mods
                 if (WIEntry.MaxMods > 0 && (itemEntry.ItemEntryModifications.AttachmentSettings ??= !WIEntry.IsLiquidWeapon ? new() : null) is ItemEntrySettings.ItemModSettings itemMods)
@@ -1750,7 +1851,10 @@ namespace Oxide.Plugins
                     }
 
                     if (invalidMods.Any())
+                    {
                         itemEntry.ItemEntryModifications.AttachmentSettings.itemMods.RemoveAll(x => invalidMods.Contains(x));
+                        itemEntry.ItemEntryModifications.InvalidateRuntimeCaches();
+                    }
 
                     Pool.FreeUnmanaged(ref invalidMods);
                     
@@ -1871,6 +1975,12 @@ namespace Oxide.Plugins
             if (modifiedLootGroups)
                 DataSystem.SaveLootGroups();
 
+            foreach (var lootTable in lootTables.LootTables.Values)
+                lootTable.InvalidateRuntimeCaches();
+
+            foreach (var lootProfile in lootGroups.LootGroups.Values)
+                lootProfile.InvalidateRuntimeCaches();
+
             activeTypes = lootTables.LootTables.Count(table => table.Value.Enabled);
 
             Log($"Using '{activeTypes}' active of '{lootTables.LootTables.Count}' supported container types");
@@ -1933,11 +2043,12 @@ namespace Oxide.Plugins
             container.capacity = 36;
             container.Clear();
 
-            using PooledList<string> itemNames = Pool.Get<PooledList<string>>(); // Curent item shortnames
+            using PooledHashSet<string> itemNames = Pool.Get<PooledHashSet<string>>(); // Curent item shortnames
             using PooledList<Item> items = Pool.Get<PooledList<Item>>();
-            using PooledList<int> itemBlueprints = Pool.Get<PooledList<int>>();
+            using PooledHashSet<int> itemBlueprints = Pool.Get<PooledHashSet<int>>();
             using PooledList<KeyValuePair<string, LootEntrySettings>> guaranteedItemEntries = Pool.Get<PooledList<KeyValuePair<string, LootEntrySettings>>>();
             using PooledHashSet<string> currentItemEntries = Pool.Get<PooledHashSet<string>>(); // Current unique item entry tags (for duplicate generation checking)
+            using PooledList<KeyValuePair<string, LootEntrySettings>> rollGuaranteedItemEntries = Pool.Get<PooledList<KeyValuePair<string, LootEntrySettings>>>();
 
             guaranteedItemEntries.AddRange(con.GuaranteedItems);
 
@@ -1946,21 +2057,18 @@ namespace Oxide.Plugins
             {
                 Item? item = null;
                 List<Item>? bonusItems = null;
-                List<KeyValuePair<string, LootEntrySettings>> _guaranteedItemEntries = Pool.Get<List<KeyValuePair<string, LootEntrySettings>>>();
+                rollGuaranteedItemEntries.Clear();
 
                 bool isLootGroupItem = false;
                 if (con.GetRandomProfile(prefab) is LootProfile profile)
                 {
-                    if (!profile.DoProbabilitiesExist)
-                        profile.UpdateProbabilities(profile.ItemList.Select(x => x.Value.Probability));
-
                     // Get item
                     (item, bonusItems) = profile.GetItem(currentItemEntries);
 
                     if (item != null)
                     {
                         // Add all guarenteed items from profile (if profile selected use all items regardless)
-                        _guaranteedItemEntries.AddRange(profile.GuaranteedItems);
+                        rollGuaranteedItemEntries.AddRange(profile.GuaranteedItems);
                         isLootGroupItem = true;
                     }
                 }
@@ -1986,8 +2094,20 @@ namespace Oxide.Plugins
                 }
 
                 // Duplicate checking
-                var duplicatePredicate = (Item item, bool bonusItem) =>
-                    ((isLootGroupItem && !_config.LootGroupsConfig.AllowLootGroupDuplicateItems) || (bonusItem && !_config.Loot.AllowBonusItemsDuplicateItems) || (!bonusItem && !_config.Loot.AllowDuplicateItems)) && ((itemNames.Contains(item.info.shortname) || (item.IsBlueprint() && itemBlueprints.Contains(item.blueprintTarget))));
+                bool duplicatePredicate(Item checkItem, bool bonusItem)
+                {
+                    bool duplicatesDisabled =
+                        (isLootGroupItem && !_config.LootGroupsConfig.AllowLootGroupDuplicateItems) ||
+                        (bonusItem && !_config.Loot.AllowBonusItemsDuplicateItems) ||
+                        (!bonusItem && !_config.Loot.AllowDuplicateItems);
+
+                    if (!duplicatesDisabled)
+                        return false;
+
+                    return checkItem.IsBlueprint()
+                        ? itemBlueprints.Contains(checkItem.blueprintTarget)
+                        : itemNames.Contains(checkItem.info.shortname);
+                }
 
                 if (duplicatePredicate(item, false))
                 {
@@ -2022,25 +2142,69 @@ namespace Oxide.Plugins
                     foreach (Item bonusItem in bonusItems)
                     {
                         if (duplicatePredicate(bonusItem, true))
-                            item.Remove();
+                        {
+                            bonusItem.Remove();
+                            continue;
+                        }
+
+                        if (storedBlacklist.ItemList.Contains(bonusItem.info.shortname))
+                        {
+                            bonusItem.Remove();
+                            continue;
+                        }
+
+                        if (bonusItem.IsBlueprint())
+                            itemBlueprints.Add(bonusItem.blueprintTarget);
                         else
-                            items.Add(bonusItem);
+                            itemNames.Add(bonusItem.info.shortname);
+
+                        items.Add(bonusItem);
                     }
                 }
 
-                guaranteedItemEntries.AddRange(_guaranteedItemEntries);
-                Pool.FreeUnmanaged(ref _guaranteedItemEntries);
+                guaranteedItemEntries.AddRange(rollGuaranteedItemEntries);
             }
 
             foreach (var gItemEntry in guaranteedItemEntries)
             {
+                LootEntrySettings guaranteedEntry = gItemEntry.Value;
+
                 // Spawn item. No rng, just spawn em.
-                Item gItem = ItemManager.CreateByPartialName(gItemEntry.Key, GetRNG(gItemEntry.Value.Min, gItemEntry.Value.Max), gItemEntry.Value.SkinId);
+                Item gItem = ItemManager.CreateByName(guaranteedEntry.CachedShortname ?? gItemEntry.Key, GetRNG(guaranteedEntry.Min, guaranteedEntry.Max), guaranteedEntry.SkinId);
                 if (gItem is null)
                     continue;
 
-                if (gItemEntry.Value.DurabilitySettings is LootEntryDurability durability)
+                if (!string.IsNullOrWhiteSpace(guaranteedEntry.DisplayName))
+                    gItem.name = guaranteedEntry.DisplayName;
+
+                guaranteedEntry.ApplyAttachments(gItem);
+                guaranteedEntry.ApplyAmmo(gItem);
+
+                if (guaranteedEntry.DurabilitySettings is LootEntryDurability durability)
                     gItem.ChangeConditionPercentage(GetRNG(durability.MinDurability, durability.MaxDurability));
+
+                gItem.MarkDirty();
+
+                if (storedBlacklist.ItemList.Contains(gItem.info.shortname))
+                {
+                    gItem.Remove();
+                    continue;
+                }
+
+                bool guaranteedDuplicate = gItem.IsBlueprint()
+                    ? itemBlueprints.Contains(gItem.blueprintTarget)
+                    : itemNames.Contains(gItem.info.shortname);
+
+                if (guaranteedDuplicate)
+                {
+                    gItem.Remove();
+                    continue;
+                }
+
+                if (gItem.IsBlueprint())
+                    itemBlueprints.Add(gItem.blueprintTarget);
+                else
+                    itemNames.Add(gItem.info.shortname);
 
                 items.Add(gItem);
             }
@@ -2063,9 +2227,15 @@ namespace Oxide.Plugins
                 items.Add(ItemManager.CreateByItemID(-932201673, scrapAmt * _config.Loot.ScrapMultiplier)); // Scrap item ID
 
             items.Shuffle((uint)UnityEngine.Random.Range(0, 100));
-            foreach (var item in items.Where(x => x != null && x.IsValid()))
-                if (!item.MoveToContainer(container)) // broken item fix / fixes full container 
-                    item.DoRemove();
+            for (int i = 0; i < items.Count; i++)
+            {
+                Item? movedItem = items[i];
+                if (movedItem == null || !movedItem.IsValid())
+                    continue;
+
+                if (!movedItem.MoveToContainer(container)) // broken item fix / fixes full container 
+                    movedItem.DoRemove();
+            }
 
             container.capacity = container.itemList.Count;
             container.MarkDirty();
@@ -2250,7 +2420,7 @@ namespace Oxide.Plugins
                     continue;
                 }
 
-                string itemShortname = UniqueTagREGEX.Replace(itemEntryName, string.Empty);  // Remove tag
+                string itemShortname = lootEntry.CachedShortname ?? UniqueTagREGEX.Replace(itemEntryName, string.Empty);  // Remove tag
                 ItemDefinition itemDef = ItemManager.FindItemDefinition(itemShortname);
 
                 if (asBP && itemDef.Blueprint != null && itemDef.Blueprint.isResearchable)
