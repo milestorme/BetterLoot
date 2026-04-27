@@ -198,7 +198,7 @@ namespace Oxide.Plugins
             if (_config.Generic.OnlyUpdatePrefabListOnWipe && !NewSave) // If it is a new wipe new found prefabs will be auto enabled.
                 return;
 
-            NewConfigGenerated = !_config.Generic.WatchedPrefabs.Any();
+            NewConfigGenerated = _config.Generic.WatchedPrefabs.Count == 0;
 
             if (NewConfigGenerated)
                 Log("Checking for missing viable loot containers in prefab watch list. (Currently disabled containers will stay disabled).");
@@ -208,8 +208,8 @@ namespace Oxide.Plugins
             List<string> partialNames = Pool.Get<List<string>>();
             
             // If does not contain, skip
-            negativePartialNames.AddRange(
-                new List<string> {
+            negativePartialNames.AddRange(new[]
+            {
                     "resource/loot",
                     "misc/supply drop/supply_drop",
                     "/npc/m2bradley/bradley_crate",
@@ -224,13 +224,11 @@ namespace Oxide.Plugins
                     "ptboat.deepsea",
                     "rhib.deepsea",
                     "cache/food"
-                }
-            );
+            });
 
             // If does contain, skip
-            partialNames.AddRange(
-                new List<string>
-                {
+            partialNames.AddRange(new[]
+            {
                     "radtown/ore",
                     "static",
                     "/spawners",
@@ -238,8 +236,7 @@ namespace Oxide.Plugins
                     "radtown/loot_component_test",
                     "chinooklockedcrate/chinooklockedcrate", // Specific crate with no spawnable
                     "water_puddles_border_fix" // Weird container prefab from radtown update??
-                }
-            );
+            });
 
             // Adding default values
             foreach (GameManifest.PrefabProperties category in GameManifest.Current.prefabProperties)
@@ -250,7 +247,7 @@ namespace Oxide.Plugins
                     continue;
 
                 // Add false by default, may have been disabled by user if was not in list from previous version. If is a new wipe and auto-enable is set, containers will be added as enabled prefabs.
-                _config.Generic.WatchedPrefabs.TryAdd(name, NewConfigGenerated || (NewSave && _config.Generic.AutoEnableNewContainers) ? true : false); 
+                _config.Generic.WatchedPrefabs.TryAdd(name, NewConfigGenerated || (NewSave && _config.Generic.AutoEnableNewContainers));
             }
 
             if (NewConfigGenerated)
@@ -366,7 +363,7 @@ namespace Oxide.Plugins
         {
             _instance = this;
             RNG = new Random();
-            UniqueTagREGEX = new Regex(@"\{\d+\}");
+            UniqueTagREGEX = new Regex(@"\{\d+\}", RegexOptions.Compiled);
 
             DataSystem.LoadBlacklist();
             DataSystem.LoadLootTables();
@@ -2038,13 +2035,22 @@ namespace Oxide.Plugins
                 return false;
 
             int min = con.ItemSettings.ItemsMin, max = con.ItemSettings.ItemsMax;
+            int maxBPs = con.ItemSettings.MaxBPs;
             int itemCount = Math.Clamp(GetRNG(Math.Min(min, max), Math.Max(min, max)), 1, 36);
 
             container.capacity = 36;
             container.Clear();
 
-            using PooledHashSet<string> itemNames = Pool.Get<PooledHashSet<string>>(); // Curent item shortnames
+            // LINQ/runtime hot path optimizations courtesy of Shady14u: cache config values used repeatedly during population.
+            bool allowDupes = _config.Loot.AllowDuplicateItems;
+            bool allowGroupDupes = _config.LootGroupsConfig.AllowLootGroupDuplicateItems;
+            bool allowBonusDupes = _config.Loot.AllowBonusItemsDuplicateItems;
+
+            using PooledHashSet<string> itemNames = Pool.Get<PooledHashSet<string>>(); // Current item shortnames
             using PooledList<Item> items = Pool.Get<PooledList<Item>>();
+            if (items.Capacity < itemCount + 5)
+                items.Capacity = itemCount + 5;
+
             using PooledHashSet<int> itemBlueprints = Pool.Get<PooledHashSet<int>>();
             using PooledList<KeyValuePair<string, LootEntrySettings>> guaranteedItemEntries = Pool.Get<PooledList<KeyValuePair<string, LootEntrySettings>>>();
             using PooledHashSet<string> currentItemEntries = Pool.Get<PooledHashSet<string>>(); // Current unique item entry tags (for duplicate generation checking)
@@ -2077,7 +2083,7 @@ namespace Oxide.Plugins
                 try
                 {
                     if (item == null)
-                        (item, bonusItems) = MightyRNG(con, currentItemEntries, prefab, itemCount, itemBlueprints.Count >= con.ItemSettings.MaxBPs);
+                        (item, bonusItems) = MightyRNG(con, currentItemEntries, prefab, itemCount, itemBlueprints.Count >= maxBPs);
                 } catch (Exception e)
                 {
                     Puts($"[ERROR]: Failed to generate item for \"{prefab}\". Reason: {e.Message} \n{e.StackTrace}");
@@ -2097,9 +2103,9 @@ namespace Oxide.Plugins
                 bool duplicatePredicate(Item checkItem, bool bonusItem)
                 {
                     bool duplicatesDisabled =
-                        (isLootGroupItem && !_config.LootGroupsConfig.AllowLootGroupDuplicateItems) ||
-                        (bonusItem && !_config.Loot.AllowBonusItemsDuplicateItems) ||
-                        (!bonusItem && !_config.Loot.AllowDuplicateItems);
+                        (isLootGroupItem && !allowGroupDupes) ||
+                        (bonusItem && !allowBonusDupes) ||
+                        (!bonusItem && !allowDupes);
 
                     if (!duplicatesDisabled)
                         return false;
@@ -2298,8 +2304,8 @@ namespace Oxide.Plugins
                 .OrderBy(c => c.transform.position.x).ThenBy(c => c.transform.position.z)
                 .ToList();
             
-            var count = spawns.Count();
-            var racelimit = count ^ 2;
+            var count = spawns.Count;
+            var racelimit = count * count;
 
             var antirace = 0;
             var deleted = 0;
